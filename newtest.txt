@@ -1,0 +1,579 @@
+
+//
+// A very simple distributed file server
+//
+
+
+#include <stdio.h>
+#include <stdint.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <time.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <dirent.h>
+
+
+#include "dfs.h"
+
+int debug = 1;
+
+typedef struct connection_s {
+    int readfd;
+    int writefd;
+    FILE *readfile;
+    FILE *writefile;
+    char *base_directory;
+} connection_t;
+
+typedef struct userinfo_s {
+    struct userinfo_s *next;
+    char *username;
+    char *password;
+} userinfo_t;
+
+// the linked list of users.
+userinfo_t *userlist = NULL;
+
+char *cmdnames[] = {"GET","PUT","LIST","MKDIR","DELETE","RMDIR"};
+
+static int min(int a,int b)
+{
+    if (a < b) {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+userinfo_t *finduser(char *uname)
+{
+    userinfo_t *uinfo;
+
+    uinfo = userlist;
+
+    while (uinfo != NULL) {
+        if (strcmp(uname,uinfo->username) == 0) {
+            return uinfo;
+        }
+       
+        uinfo = uinfo->next;
+    }
+
+    return NULL;
+}
+
+int checkpassword(char *uname,char *pword)
+{
+    userinfo_t *uinfo = finduser(uname);
+
+    // If the user is not found, the password is invalid
+    if (uinfo == NULL) {
+        return 0;
+    }
+
+    // If the user was found and the password does not match, it's invalid.
+    if (strcmp(uinfo->password,pword) != 0) {
+        return 0;
+    }
+
+    // otherwise good to go
+    return 1;
+}
+
+void adduser(char *uname, char *pword)
+{
+    userinfo_t *uinfo;
+
+    // Create a new userinfo structure
+    uinfo = (userinfo_t *) calloc(1,sizeof(userinfo_t));
+
+    uinfo->username = strdup(uname);
+    uinfo->password = strdup(pword);
+
+    // Add to the linked list
+    uinfo->next = userlist;
+    userlist = uinfo;
+
+}
+
+int readconfig(char *filename)
+{
+    FILE *file;
+    char *x;
+    char line[1000];
+    char *uname;
+    char *pword;
+
+    file = fopen(filename,"r");
+    if (!file) {
+        return -1;
+    }
+
+    while (!feof(file)) {
+        if (!fgets(line,sizeof(line),file)) {
+            break;
+        }
+
+        // remove the newline
+        x = strchr(line,'\n');
+        if (x) *x = '\0';
+
+        // check for blank lines or comments
+        if ((line[0] == '\0') || (line[0] == '#')) {
+            continue;
+        }
+
+        // Break off two words from the line, one is the username, the other is the password
+        x = line;
+        uname = strsep(&x," ");
+        pword = strsep(&x," ");
+
+        if (uname && pword) {
+            printf("Added user '%s' with password '%s'\n",uname,pword);
+            adduser(uname, pword);
+        }
+    }
+
+
+    fclose(file);
+
+    return 0;
+}
+
+void close_connection(connection_t *conn)
+{
+    if (debug > 1) {
+        printf("--- Closing thread for FD %d\n",conn->readfd);
+    }
+
+    // Close the streams
+    fclose(conn->readfile);
+    fclose(conn->writefile);
+
+    // Free the 'connection' structure
+    free(conn);          
+
+    // Cause this thread to exit
+    pthread_exit(NULL);
+}
+
+void send_status(connection_t *conn, header_t *header, int status)
+{
+    header->size = 0;
+    header->status = status;
+
+    fwrite(header,sizeof(header_t),1,conn->writefile);
+    fflush(conn->writefile);
+}
+
+static void construct_filename(connection_t *conn,header_t *header,char *filename)
+{
+    // make a file name from the connection info and the header.
+    // if our base_directory is "DFS1" and the username is "Alice", and the file is "foo.txt.1",
+    // we will return   DFS1/Alice/.foo.txt.1
+    snprintf(filename,MAX_FILENAME,"%s/%s/.%s",conn->base_directory,header->username,header->filename);
+}
+
+void cmd_get(connection_t *conn,header_t *header)
+{
+    char filename[MAX_FILENAME];
+    struct stat statbuf;
+    int fd;
+    uint8_t chunk[1024];
+    int res;
+
+    construct_filename(conn,header,filename);
+
+    if (stat(filename,&statbuf) < 0) {
+        send_status(conn, header, STATUS_FILENOTFOUND);
+        return;
+    }
+
+    fd = open(filename,O_RDONLY);
+    if (fd < 0) {
+        send_status(conn, header, STATUS_FILENOTFOUND);
+        return;
+    }
+
+    header->size = statbuf.st_size;
+    header->status = STATUS_OK;
+    
+    fwrite(header,1,sizeof(header_t),conn->writefile);
+
+    for (;;) {
+        res = read(fd,chunk,sizeof(chunk));
+        if (res <= 0) {
+            break;
+        }
+        fwrite(chunk,res,sizeof(uint8_t),conn->writefile);
+    }
+
+    fflush(conn->writefile);
+
+}
+
+void cmd_put(connection_t *conn,header_t *header)
+{
+    int fd;
+    int res;
+    char filename[MAX_FILENAME];
+    int remsize;
+    int amtread;
+    uint8_t chunk[1024];
+
+    construct_filename(conn,header,filename);
+
+    fd = open(filename,O_RDWR|O_TRUNC|O_CREAT,S_IREAD|S_IWRITE);
+
+    remsize = header->size;
+
+    for (;;) {
+        amtread = min(sizeof(chunk),remsize);
+        res = fread(chunk,sizeof(char),amtread,conn->readfile);
+
+        if (fd > 0) {
+            write(fd,chunk,amtread);
+        }
+
+        remsize = remsize - amtread;
+    }
+
+    if (fd > 0) {
+        close(fd);
+        send_status(conn,header,STATUS_OK);
+    } else {
+        send_status(conn,header,STATUS_ERR);
+    }
+    
+}
+
+/* fill_in_directory: get list of files in a directory 
+   most of this routine was found on the manual page for 'readdir'
+   code taken from PA1. */
+
+int fill_in_directory(char *dirname, char *buffer, int maxlen)
+{
+    DIR *dirp;
+    struct dirent *dp;
+
+    buffer[0] = '\0';
+
+    dirp = opendir(dirname);
+    if (dirp == NULL)
+        return 0;
+
+    while ((dp = readdir(dirp)) != NULL) {
+
+        // do not send the special "." and ".." files
+        if ((strcmp(dp->d_name,".") == 0) || (strcmp(dp->d_name,"..") == 0)) {
+            continue;
+        }
+
+        // Only send files starting wtih a dot (these ar DFS files).
+        if (dp->d_name[0] != '.') {
+            continue;
+        }
+
+        // Stop if we would overflow our buffer
+        if ((strlen(buffer) + strlen(dp->d_name) + 2) > maxlen) {
+            break;
+        }
+
+        // Send back the file names without the dot, that's what the &name[1] is for.
+        strcat(buffer,&dp->d_name[1]);
+        strcat(buffer,"\n");
+    }
+    closedir(dirp);
+
+    return strlen(buffer);
+}
+
+void cmd_list(connection_t *conn,header_t *header)
+{
+    char *filelist;
+    int len;
+
+    // Allocate a big-enough buffer for the file list
+    filelist = malloc(50000);
+
+    // Use the directory reader from PA1 
+    len = fill_in_directory(header->filename,filelist,50000);
+
+    // Write out the header to the client
+    header->size = len;
+    header->status = STATUS_OK;
+    fwrite(header,sizeof(header_t),1,conn->writefile);
+
+    // If there is any files in the file list, send those back.
+    if (len > 0) {
+        fwrite(filelist,sizeof(char),len,conn->writefile);
+    }
+
+    fflush(conn->writefile);
+
+    free(filelist);
+
+}
+
+void cmd_mkdir(connection_t *conn,header_t *header)
+{
+    int res;
+
+    // Try to create the directory
+    res = mkdir(header->filename,0777);
+
+    // return status result
+    if (res < 0) {
+        send_status(conn,header,STATUS_ERR);
+    } else {
+        send_status(conn,header,STATUS_OK);
+    }
+}
+
+
+void cmd_rmdir(connection_t *conn,header_t *header)
+{
+    int res;
+
+    // Try to remove the directory
+    res = rmdir(header->filename);
+
+    // return status result
+    if (res < 0) {
+        send_status(conn,header,STATUS_ERR);
+    } else {
+        send_status(conn,header,STATUS_OK);
+    }
+}
+
+void cmd_delete(connection_t *conn,header_t *header)
+{
+    int res;
+
+    // Try to remove the file
+    res = remove(header->filename);
+
+    // return status result
+    if (res < 0) {
+        send_status(conn,header,STATUS_ERR);
+    } else {
+        send_status(conn,header,STATUS_OK);
+    }
+}
+
+
+void *dfsthread(void *info)
+{
+    connection_t *conn = (connection_t *) info;
+
+    if (debug > 1) {
+        printf("+++ Creating new thread for FD %d\n",conn->readfd);
+    }
+
+    // Create a read and a write FILE structure 
+    // https://ycpcs.github.io/cs365-spring2017/lectures/lecture15.html
+    conn->writefd = dup(conn->readfd);
+
+    // 'fdopen' lets us turn a file descriptor into a FILE *, like we get 
+    // when you call fopen() on a file name.
+    // Make one FILE * for reading, one for writing
+    conn->readfile = fdopen(conn->readfd,"r");
+    conn->writefile = fdopen(conn->writefd,"w");
+
+    // Drop into the loop here waiting for commands from the server.
+
+    for (;;) {
+        header_t header;
+
+        if (fread(&header,sizeof(header),1,conn->readfile) != sizeof(header)) {
+            // we did not get all of the data, the connection must be gone
+            break;
+        }
+
+        // Check username and password right away.
+        // If the password is wrong zero out the size and send back just the header
+        // with an "invalid password" status
+
+        if (checkpassword(header.username,header.password) == 0) {
+            send_status(conn,&header,STATUS_INVPASSWORD);
+            // go back to next command.
+            continue;
+        }
+
+        if (debug > 0) {
+            if (header.command <= CMD_MAX) {
+                printf("%s: Cmd:%s File:'%s'\n",conn->base_directory,cmdnames[header.command],header.filename);
+            } else {
+                printf("%s: Bad command %d\n",conn->base_directory,header.command);
+            }
+        }
+
+        // Call a subroutine for each command
+        switch (header.command) {
+            case CMD_GET:
+                cmd_get(conn,&header);
+                break;
+            case CMD_PUT:
+                cmd_put(conn,&header);
+                break;
+            case CMD_LIST:
+                cmd_list(conn,&header);
+                break;
+            case CMD_MKDIR:
+                cmd_mkdir(conn,&header);
+                break;
+            case CMD_RMDIR:
+                cmd_rmdir(conn,&header);
+                break;
+            case CMD_DELETE:
+                cmd_delete(conn,&header);
+                break;
+            default:
+                send_status(conn,&header,STATUS_INVCOMMAND);
+                break;
+        }
+    }
+
+
+    // we only do one connection at a time
+    close_connection(conn);
+
+    return NULL;
+
+}
+
+// main loop of the file server.  Wait for a connection, accept it,
+// and spawn a thread.
+
+void dfsserver(char *directory, int portno)
+{
+    struct sockaddr_in serveraddr;
+    int listen_fd;
+    int res;
+    int set = 1;
+
+    bzero((char *) &serveraddr, sizeof(serveraddr));
+    serveraddr.sin_family = AF_INET;
+    serveraddr.sin_port = htons(portno);
+
+    // Create a listening socket
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    res = setsockopt(listen_fd,SOL_SOCKET,SO_REUSEADDR,&set,sizeof(set));
+    if (res < 0) {
+        perror("setsockopt");
+        close(listen_fd);
+        return;
+    }
+
+    // Bind to the port we will listen on.
+    res = bind(listen_fd,(struct sockaddr *) &serveraddr,sizeof(serveraddr));
+    if (res < 0) {
+        perror("bind");
+        close(listen_fd);
+        return;
+    }
+
+    // Start listening for connections.
+    listen(listen_fd, 10);              // max # of connections we can accept
+
+
+    printf("Waiting for connections\n");
+
+    // Here is the main loop.
+
+    for (;;) {
+
+        // this sockaddr will get filled in with the IP of the client that connects to us.
+        struct sockaddr_in newaddr;
+        socklen_t newaddrlen  = sizeof(newaddr);
+        pthread_attr_t threadattr;
+        pthread_t thread;
+        int nfd;
+        connection_t *conn;
+
+        // Accept next connection
+
+        nfd = accept(listen_fd, (struct sockaddr *) &newaddr, &newaddrlen);
+
+        if (nfd < 0) {
+            perror("accept");
+            continue;
+        }
+
+        if (debug > 0) {
+            printf("Got a connection from %s\n",inet_ntoa(newaddr.sin_addr));
+        }
+
+        // Create a connection structure to hold information about the connection
+        conn = (connection_t *) calloc(1,sizeof(connection_t));
+        conn->readfd = nfd;
+        conn->base_directory = directory;
+
+        // Create a new thread
+        pthread_attr_init(&threadattr);
+        pthread_create(&thread, &threadattr, dfsthread, conn);
+
+        // The new thread is responsible for closing the connection when done.
+        // Go back and wait for another one.
+    }
+}
+
+//
+// Main function
+//
+
+int main(int argc, char *argv[])
+{
+    int port;
+    char *directory;
+    struct stat statbuf;
+
+    if (argc < 3) {
+        printf("Usage: dfs root-directory port-number\n");
+        printf("\n");
+        printf("For example,  dfs DFS1 10001\n");
+        exit(1);
+    }
+
+    directory = argv[1];
+    port = atoi(argv[2]);
+
+    printf("Starting DFS server with home directory '%s' on port %d\n",directory,port);
+
+    // Load the user list
+
+    if (readconfig("dfs.conf") < 0) {
+        printf("Could not load configuration file 'dfs.conf'\n");
+        exit(1);
+    }
+
+
+    // Create DFS directory if needed
+
+    if (stat(directory,&statbuf) < 0) {
+        if (mkdir(directory,0777) < 0) {
+            printf("Error, could not create DFS directory '%s'\n",directory);
+        } else {
+            printf("Created DFS directory: %s\n",directory);
+        }
+    } else {
+        printf("DFS directory %s already exists\n",directory);
+    }
+
+
+    // Start the server
+    dfsserver(directory,port);
+
+    return 0;
+}
